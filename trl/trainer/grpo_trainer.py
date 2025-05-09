@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import inspect
 import os
 import textwrap
 import warnings
@@ -1139,9 +1141,26 @@ class GRPOTrainer(Trainer):
             completions = completions_text
 
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        
+        # Separate sync and async reward functions
+        sync_funcs = []
+        async_funcs = []
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
         ):
+            if inspect.iscoroutinefunction(reward_func):
+                async_funcs.append((i, reward_func, reward_func_name))
+            else:
+                sync_funcs.append((i, reward_func, reward_processing_class, reward_func_name))
+        
+        # TODO: maybe check if all reward functions are not nn.Module before running this
+        # Repeat all input columns (but "prompt", "completion", and "completion_ids") to match the number
+        # of generations
+        keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
+        reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                    
+        # --- Execute Synchronous Reward Functions ---
+        for i, reward_func, reward_processing_class, reward_func_name in sync_funcs:
             with profiling_context(self, reward_func_name):
                 if isinstance(
                     reward_func, nn.Module
@@ -1158,10 +1177,6 @@ class GRPOTrainer(Trainer):
                     with torch.inference_mode():
                         rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
                 else:
-                    # Repeat all input columns (but "prompt", "completion", and "completion_ids") to match the number
-                    # of generations
-                    keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
-                    reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
                     output_reward_func = reward_func(
                         prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
                     )
@@ -1169,6 +1184,36 @@ class GRPOTrainer(Trainer):
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
 
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+        # --- Execute Asynchronous Reward Functions ---
+        if async_funcs:
+            indices = [i for i, _, __ in async_funcs]
+
+            async def get_async_rewards():
+                tasks = []
+                for _, reward_func, reward_func_name in async_funcs:
+                    # Wrap the async call in a profiling context if possible (might need adaptation for async)
+                    # with profiling_context(self, reward_func_name): 
+                    tasks.append(
+                        reward_func(
+                            prompts=prompts, 
+                            completions=completions, 
+                            completion_ids=completion_ids_list, 
+                            **reward_kwargs
+                        )
+                    )
+                results_list = await asyncio.gather(*tasks)
+                return results_list
+
+            # Run the async functions concurrently
+            all_async_results = asyncio.run(get_async_rewards())
+
+            # Process results and populate the tensor
+            for i, result in zip(indices, all_async_results):
+                 # Convert None values to NaN
+                output_reward_func = [reward if reward is not None else torch.nan for reward in result]
+                
+                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
         # If all reward functions return None for a given row, issue a detailed warning
         if torch.isnan(rewards_per_func).all(dim=1).any():
